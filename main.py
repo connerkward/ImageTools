@@ -1,6 +1,6 @@
-
 # - metadata tags baked into the files and an external library file, such that if the metadata is accidentally stripped during a file transfer, can reference and re-update files via the library (trivial)
-# - image recognition / tag suggestion (extremely difficult problem as posted by @grandpa on google photos) - freeform text search of tags (trivial to get "good enough")
+# - image recognition / tag suggestion (extremely difficult problem as posted by @grandpa on google photos)
+# - freeform text search of tags (trivial to get "good enough")
 # - color detection (medium difficulty problem, is a matter of what method is used to determine "average" colors
 # - Pay for api calls?
 
@@ -13,21 +13,39 @@ import imagehash
 import pytesseract
 import cv2
 import ctoken
+from PIL.ExifTags import TAGS
+import pathlib
+import datetime
+from collections import defaultdict
+import json
+from PIL.ExifTags import GPSTAGS
+from PIL.TiffImagePlugin import IFDRational
 
-
-def traverse(path: str, dest: str, other:str, valid_extensions: set) -> None:
+# EXTRACT --------------------------------------------------------------
+def traverse(file_path: str, dest: str, other:str, valid_extensions: set):
     """
     Flattens files from path, copies unique files (no duplicates) to destination.
     On Windows, should preserve file metadata.
-    :param path: path to be traversed.
+    :param file_path: path to be traversed.
     :param dest: destination directory files will be copied to.
     :param other: directory where non valid files are sent
     :param valid_extensions: set of valid file extensions without period (IE {"zip", "pdf"})
     :return: void return
     """
-    output_store_filename = "index.dat"
+    output_store_filename = "metadata.dat"
+    bad_file_store_filename = "bad-files.log"
     all_file_paths = set()
-    unique_files = dict()
+    unique_files = dict()  # {hash:path}
+    metadata_dict = dict()  # {hash:{metadata:str}} # date created, location,
+    '''
+    0x9003	DateTimeOriginal	string	ExifIFD	(date/time when original image was taken)
+    0x9004	CreateDate	string	ExifIFD	(called DateTimeDigitized by the EXIF spec.)
+    0x9010	OffsetTime	string	ExifIFD	(time zone for ModifyDate)
+    0x9011	OffsetTimeOriginal	string	ExifIFD	(time zone for DateTimeOriginal)
+    0x9012	OffsetTimeDigitized	string	ExifIFD	(time zone for CreateDate)
+    36867	0×9003	ASCII string	Date Taken	YYYY:MM:DD HH:MM:SS
+    36868	0×9004	ASCII string	Date Created	YYYY:MM:DD HH:MM:SS
+    '''
     bad_files = list()
     # Make Directory
     try:
@@ -39,7 +57,7 @@ def traverse(path: str, dest: str, other:str, valid_extensions: set) -> None:
     # print("file count", file_count)
 
     # Traverse Files
-    for root, _dirs, files in os.walk(path):
+    for root, _dirs, files in os.walk(file_path):
         for filename in files:
             if os.path.splitext(filename)[1].strip(".").lower() in valid_extensions:  # file extension
                 try:
@@ -54,6 +72,7 @@ def traverse(path: str, dest: str, other:str, valid_extensions: set) -> None:
                     else:
                         # Add to Filename Store
                         all_file_paths.add(os.path.join(root, filename))
+                        # folder = os.path.basename(root)
                         unique_files[filename_hash] = os.path.join(root, filename)
                 except UnidentifiedImageError:
                     print("error, potentially bad filename. adding to bad files:", filename)
@@ -65,41 +84,125 @@ def traverse(path: str, dest: str, other:str, valid_extensions: set) -> None:
         file_path = unique_files[file_hash_key]
         try:
             shutil.copy2(file_path, dest)
+            metadata_dict[str(file_hash_key)] = extract_metadata(file_path).copy()
         except shutil.Error:
             while True:
                 dup_count += 1
-                full = os.path.basename(file_path)
-                print(full)
-                filename = os.path.splitext(full)[0]
+                # full = os.path.basename(file_path)
+                # filename = os.path.splitext(full)[0]
                 extension = os.path.splitext(file_path)[1].lower()
                 final_des = os.path.join(dest, f"fd-{dup_count}{extension}")
                 if os.path.exists(final_des):
                     break
                 else:
+                    metadata_dict[str(file_hash_key)] = extract_metadata(file_path).copy()
                     shutil.copy2(file_path, final_des)
-                    print(final_des)
                     break
+        print(os.path.basename(file_path), metadata_dict[str(file_hash_key)])
     print("bad files:")
     print(bad_files)
-    # Logs
-    # os.remove(output_store_filename)
-    # with open(output_store_filename, "w") as f:
-    #     for file_hash in unique_files.keys():
-    #         f.write(f"{unique_files[file_hash]}\n")
+    with open(os.path.join(dest, output_store_filename), "w") as f:
+        json.dump(metadata_dict, f)
+    return metadata_dict
 
-def image2string(path):
+
+def get_coordinates(exif_gps_data):
+    """
+    Helper from https://developer.here.com/blog/getting-started-with-geocoding-exif-image-metadata-in-python3
+    :param exif_gps_data:
+    :return:
+    """
+    def get_decimal_from_dms(dms, ref):
+        degrees = float(dms[0])
+        minutes = float(dms[1]) / 60.0
+        seconds = float(dms[2]) / 3600.0
+        if ref in ['S', 'W']:
+            degrees = -degrees
+            minutes = -minutes
+            seconds = -seconds
+        return round(degrees + minutes + seconds, 10)
+
+    lat = get_decimal_from_dms(exif_gps_data['GPSLatitude'], exif_gps_data['GPSLatitudeRef'])
+    lon = get_decimal_from_dms(exif_gps_data['GPSLongitude'], exif_gps_data['GPSLongitudeRef'])
+    return (lat,lon)
+
+
+def extract_metadata(file_path:str) -> dict:
+    """
+    Extracts relevant exif and OS file metadata if possible: (earliest) date created, GPS data, camera model.
+    :param image_file:
+    :return: dictionary {exif_tag_name:}
+    """
+    valid_tagID = {306, 36867, 36868, 272, 271, 34853}
+    # cr date, cr date, cr date, camera model, camera make, gps data
+    valid_gps_tags = {"GPSAltitude", "GPSLongitude", "GPSLatitude", "GPSLatitudeRef", "GPSLongitudeRef"}
+    metadata_entry = dict()
+    metadata_entry["DateTime"] = dict()
+    exifdata = Image.open(file_path).getexif()
+    for tag_id in exifdata:
+        try:
+            if tag_id in valid_tagID:
+                tag = TAGS.get(tag_id, tag_id)  # tag name
+                data = exifdata.get(tag_id)
+                # GPS TAG
+                if tag_id == 34853:
+                    exif_gps_data = {val:data[key] for (key, val) in GPSTAGS.items()
+                                           if key in data and val in valid_gps_tags}
+                    # Cleaning up IFDRational types to floats
+                    for key in exif_gps_data.keys():
+                        if type(exif_gps_data[key]) == IFDRational:
+                            exif_gps_data[key] = float(exif_gps_data[key])
+                        if type(exif_gps_data[key]) == tuple:
+                            exif_gps_data[key] = list(exif_gps_data[key])
+                            for index, val in enumerate(exif_gps_data[key]):
+                                exif_gps_data[key][index] = float(exif_gps_data[key][index])
+                    metadata_entry[tag] = exif_gps_data
+                    metadata_entry["GPSInfo"]["GPSCoordinates"] = get_coordinates(exif_gps_data)
+                # DATETIME TAG(S)
+                elif tag_id == 306 or tag_id == 36867 or tag_id == 36868:
+                    date_time_obj = datetime.datetime.strptime(data, '%Y:%m:%d %H:%M:%S')
+                    metadata_entry["DateTime"][tag] = date_time_obj
+                # OTHER TAG(S)
+                else:
+                    metadata_entry[tag] = data
+                    # decode bytes
+                    # if isinstance(data, bytes):
+                    #     print(data)
+                    #     data = str.encode(data, 'utf-8').decode()
+                    #     print(data)
+                    #     # data = data.decode()
+                    # print(f"{tag_id}-{tag:25}: {data}")
+        except UnicodeDecodeError:
+            pass
+    metadata_entry["DateTime"]["OSDateTime"] = datetime.datetime.fromtimestamp(pathlib.Path(file_path).stat().st_ctime)
+    metadata_entry["DateTime"] = min(metadata_entry["DateTime"].values()).strftime("%Y-%m-%d %H:%M:%S")
+    metadata_entry["folder"] = os.path.basename(os.path.dirname(file_path))
+    metadata_entry["hash_scheme"] = "whash"
+    metadata_entry["original_filename"] = os.path.basename(file_path)
+    return metadata_entry
+
+
+# PROCESSING --------------------------------------------------------------
+def image2string(file_path):
     img = cv2.imread(path)  # read file
     img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)  # greyscale
     img = cv2.threshold(img, 0, 255, type=cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]  # threshold
     return ctoken.tokenize(pytesseract.image_to_string(img, lang='eng').strip())  # tokenize
 
+
+def colors():
+    pass
+
+
 if __name__ == "__main__":
     valid_file_extentions = {"gif", "jpg", "jpeg", "jpeg-large", "png", "webp"}
-    path = "/Users/connerward/Desktop"
+    # path = "/Users/connerward/Desktop"
     destination = "/Users/connerward/Documents/output"
+    path = "/Users/connerward/PycharmProjects/ImageTools"
+    # destination = "/output"
     other_files_dest = "other-files/"
 
     # Flattens files from path, copies unique files (no duplicates) to destination.
-    traverse(path=path, dest=destination, other=other_files_dest, valid_extensions=valid_file_extentions)
-
+    meta = traverse(file_path=path, dest=destination, other=other_files_dest, valid_extensions=valid_file_extentions)
+    print(meta)
 
