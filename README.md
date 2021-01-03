@@ -1,1 +1,22 @@
 # ImageTools
+- Extract
+    - ~Flatten hierarchy
+    - ~remove exact duplicates
+    - ~store raw file metadata in metadata store {hash:{date:, folder:. hash-scheme, filename, }} 
+        - ~Date created, location, related date info
+        - ~Name of containing folder 
+        - ~File hash and hashing scheme 
+        - ~Name of file 
+- Manual Processing (About 500-1000+ photos)
+    - Color detection
+        - Primary Colors 
+        - Average colors 
+    - Tagging 
+        - Google Tags (must be human validated, suggestions only)
+        - Human intelligence manual tagging 
+            - UI for human tagging (enter tags, suggested tags, trash bin button)
+            - P
+    - Add all processed tags into metadata store and on file 
+- Machine Learning
+    - Train ML Model (ImageAI and Apple's Training Program for ResNet)
+- Searchable metadata (either write own or check if metadata comes up in OS searches)

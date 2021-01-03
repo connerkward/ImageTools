@@ -20,13 +20,16 @@ from collections import defaultdict
 import json
 from PIL.ExifTags import GPSTAGS
 from PIL.TiffImagePlugin import IFDRational
+import colorgram
+import numpy
+import time
 
 # EXTRACT --------------------------------------------------------------
-def traverse(file_path: str, dest: str, other:str, valid_extensions: set):
+def traverse(path_directory: str, dest: str, other:str, valid_extensions: set):
     """
     Flattens files from path, copies unique files (no duplicates) to destination.
     On Windows, should preserve file metadata.
-    :param file_path: path to be traversed.
+    :param path_directory: path to be traversed.
     :param dest: destination directory files will be copied to.
     :param other: directory where non valid files are sent
     :param valid_extensions: set of valid file extensions without period (IE {"zip", "pdf"})
@@ -57,7 +60,7 @@ def traverse(file_path: str, dest: str, other:str, valid_extensions: set):
     # print("file count", file_count)
 
     # Traverse Files
-    for root, _dirs, files in os.walk(file_path):
+    for root, _dirs, files in os.walk(path_directory):
         for filename in files:
             if os.path.splitext(filename)[1].strip(".").lower() in valid_extensions:  # file extension
                 try:
@@ -81,28 +84,43 @@ def traverse(file_path: str, dest: str, other:str, valid_extensions: set):
     print("all unique files", len(unique_files))
     dup_count = 0
     for file_hash_key in unique_files.keys():
-        file_path = unique_files[file_hash_key]
+        file_directory = unique_files[file_hash_key]
         try:
-            shutil.copy2(file_path, dest)
-            metadata_dict[str(file_hash_key)] = extract_metadata(file_path).copy()
+            shutil.copy2(file_directory, dest)
+            metadata_dict[str(file_hash_key)] = extract_metadata(file_directory).copy()
         except shutil.Error:
             while True:
                 dup_count += 1
                 # full = os.path.basename(file_path)
                 # filename = os.path.splitext(full)[0]
-                extension = os.path.splitext(file_path)[1].lower()
+                extension = os.path.splitext(file_directory)[1].lower()
                 final_des = os.path.join(dest, f"fd-{dup_count}{extension}")
                 if os.path.exists(final_des):
                     break
                 else:
-                    metadata_dict[str(file_hash_key)] = extract_metadata(file_path).copy()
-                    shutil.copy2(file_path, final_des)
+                    metadata_dict[str(file_hash_key)] = extract_metadata(file_directory).copy()
+                    shutil.copy2(file_directory, final_des)
                     break
-        print(os.path.basename(file_path), metadata_dict[str(file_hash_key)])
+        # LOAD AND RESIZE IMAGE
+        t1 = time.perf_counter()
+        img = Image.open(file_directory)
+        orig_size = img.size
+        MINIMUM_SIZE = (900,900)
+        if img.size[0] > MINIMUM_SIZE[0] or img.size[1] > MINIMUM_SIZE[1]:
+            diff = MINIMUM_SIZE[0]/max(img.size)
+            x = int((img.size[0] * diff))
+            y = int((img.size[1] * diff))
+            img = img.resize((x, y), resample=Image.BILINEAR)
+        # EXTRACT COLOR
+        metadata_dict[str(file_hash_key)]["colors"] = colors(img)
+        # TEXT EXTRACTION
+        metadata_dict[str(file_hash_key)]["text"] = image2string(img)
+
+        # MAYBE DO TAG SUGGESTION?
+        print(f"{os.path.basename(file_directory)} ResizeXY:{orig_size}->{img.size} {time.perf_counter()-t1} milliseconds")
+        print(metadata_dict[str(file_hash_key)]["text"])
     print("bad files:")
     print(bad_files)
-    with open(os.path.join(dest, output_store_filename), "w") as f:
-        json.dump(metadata_dict, f)
     return metadata_dict
 
 
@@ -182,27 +200,55 @@ def extract_metadata(file_path:str) -> dict:
     return metadata_entry
 
 
+def write_metadata(metadata_dict:dict, metadata_filename="metadata.txt"):
+    with open(metadata_filename, "w") as f:
+        json.dump(metadata_dict, f)
+
 # PROCESSING --------------------------------------------------------------
-def image2string(file_path):
-    img = cv2.imread(path)  # read file
+def image2string(PIL_image):
+    img = PIL_image
+
+    img = numpy.array(img.convert('RGB'))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)  # greyscale
+
+    token_array = dict()
+    token_array["norm"] = ctoken.tokenize(pytesseract.image_to_string(img, lang='eng').strip())  # tokenize
+
+    img = cv2.bitwise_not(img)
+    token_array["invert"] = ctoken.tokenize(pytesseract.image_to_string(img, lang='eng').strip())  # tokenize
+
     img = cv2.threshold(img, 0, 255, type=cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]  # threshold
-    return ctoken.tokenize(pytesseract.image_to_string(img, lang='eng').strip())  # tokenize
+    token_array["threshold"] = ctoken.tokenize(pytesseract.image_to_string(img, lang='eng').strip())  # tokenize
+
+    final_tokens = max(sorted(token_array.items(), key=lambda x: len(x[1])))[1]
+
+    return final_tokens
 
 
-def colors():
-    pass
+def colors(PIL_image, count=8):
+    """
+    Extracts colors from the image.
+    :param image_filename: image filename
+    :param count: number of colors to generate
+    :return:
+    """
+    img = PIL_image
+    # EXTRACT COLOR
+    colors = colorgram.extract(img, count)
+    return colors
 
 
 if __name__ == "__main__":
     valid_file_extentions = {"gif", "jpg", "jpeg", "jpeg-large", "png", "webp"}
     # path = "/Users/connerward/Desktop"
-    destination = "/Users/connerward/Documents/output"
-    path = "/Users/connerward/PycharmProjects/ImageTools"
-    # destination = "/output"
-    other_files_dest = "other-files/"
+    path_directory = "/Users/connerward/PycharmProjects/ImageTools/images"
+    destination = "/Users/connerward/Documents/output-files"
+    other_files_dest = "/Users/connerward/Documents/non-output-files"
 
-    # Flattens files from path, copies unique files (no duplicates) to destination.
-    meta = traverse(file_path=path, dest=destination, other=other_files_dest, valid_extensions=valid_file_extentions)
-    print(meta)
-
+    # EXTRACT / PROCESS --------------------------------
+    # Flattens files from path, copies unique files (no duplicates) to destination, outputs metadata
+    raw_file_metadata = traverse(path_directory=path_directory,
+                                 dest=destination, other=other_files_dest,
+                                 valid_extensions=valid_file_extentions)
+    # # WRITE --------------------------------
+    # # write_metadata(raw_file_metadata)
